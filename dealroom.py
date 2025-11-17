@@ -553,40 +553,21 @@
 #     #     safe_to_excel(fundings, filename)
 
 
-"""
-Dealroom API Importer — FULL STREAMING VERSION + AUTO-RESUME + ETA
-===================================================================
-
-Особенности:
-    ✔ Zero-RAM bulk download (стриминг)
-    ✔ Автоматическое восстановление с последнего чекпоинта
-    ✔ ETA оценка времени завершения
-    ✔ Чекпоинты в CSV.GZ + JSON
-    ✔ Финальный merge без concat
-    ✔ Полный набор полей (120+)
-    ✔ Regular export, Funding export
-"""
-
 import os
-import json
 import time
+import json
 import base64
 import logging
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import List, Optional
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s — %(levelname)s — %(message)s"
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("dealroom")
 
-
-# ============================================================================
-# MAIN IMPORTER
-# ============================================================================
 
 class DealroomImporter:
 
@@ -599,9 +580,6 @@ class DealroomImporter:
             "Authorization": "Basic " + base64.b64encode(f"{api_key}:".encode()).decode()
         }
 
-    # ============================================================================
-    # FULL COMPANY FIELDS (120+)
-    # ============================================================================
     def get_all_company_fields(self) -> str:
         return (
             "id,name,deleted,path,tagline,about,type,url,"
@@ -670,282 +648,103 @@ class DealroomImporter:
         )
 
     # ============================================================================
-    # FUNDING FIELDS
+    # STREAMING BULK EXPORT — no checkpoints, no merge, retries 502-friendly
     # ============================================================================
-    def get_all_funding_fields(self) -> str:
-        return (
-            "id,year,month,day,amount,amount_source,currency,round,round_source,"
-            "valuation,valuation_source,valuation_generated_min,valuation_generated_max,"
-            "amount_eur_million,amount_usd_million,is_verified,investors,lead_investors,"
-            "transaction_multiples,source,source_round,notes"
-        )
+    def bulk_export_simple(
+        self,
+        output_file: str = "dealroom_full.csv.gz",
+        page_size: int = 100
+    ):
 
-    # ============================================================================
-    # REGULAR EXPORT (<= 10K)
-    # ============================================================================
-    def import_companies(self, n: int, keyword: str = None) -> pd.DataFrame:
-        if n > 10000:
-            logger.warning("Max=10K, reducing to 10K.")
-            n = 10000
+        # Prepare file
+        if os.path.exists(output_file):
+            os.remove(output_file)
 
-        batches = []
-        offset = 0
-        batch = 100
+        next_page_id = None
+        total = 0
+        page = 0
 
-        print(f"📊 Importing {n:,} companies...")
+        logger.info("🚀 Starting bulk export (streaming, no checkpoints)")
+        logger.info(f"Output: {output_file}")
 
-        while offset < n:
-            limit = min(batch, n - offset)
-            payload = {"fields": self.get_all_company_fields(), "limit": limit, "offset": offset}
-            if keyword:
-                payload["keyword"] = keyword
+        while True:
 
-            r = requests.post(
-                f"{self.base_url}/companies",
-                json=payload,
-                headers=self.headers,
-                timeout=60
-            )
-            r.raise_for_status()
+            page += 1
+            payload = {
+                "fields": self.get_all_company_fields(),
+                "limit": page_size
+            }
+            if next_page_id:
+                payload["next_page_id"] = next_page_id
 
-            items = r.json().get("items", [])
-            if not items:
+            # Retry loop (safe within 10 minutes)
+            for attempt in range(6):
+                try:
+                    r = requests.post(
+                        f"{self.base_url}/companies/bulk",
+                        json=payload,
+                        headers=self.headers,
+                        timeout=60
+                    )
+                    if r.status_code in (502, 503, 504):
+                        wait = 3 + attempt * 2
+                        logger.warning(f"⚠️ {r.status_code} server error. Retry {attempt+1}/6 in {wait}s")
+                        time.sleep(wait)
+                        continue
+
+                    r.raise_for_status()
+                    break
+
+                except Exception as e:
+                    wait = 3 + attempt * 2
+                    logger.error(f"Exception: {e}. Retry {attempt+1}/6 in {wait}s")
+                    time.sleep(wait)
+            else:
+                logger.error("❌ Server kept failing. Stopping cleanly.")
                 break
 
+            data = r.json()
+            items = data.get("items", [])
+            next_page_id = data.get("next_page_id")
+
+            if not items:
+                logger.info("No more items returned. Ending.")
+                break
+
+            # Write batch to file
             df = pd.json_normalize(items, sep="__")
-            batches.append(df)
-            offset += len(df)
+            df.to_csv(
+                output_file,
+                mode="a",
+                header=not os.path.exists(output_file),
+                index=False,
+                compression="gzip"
+            )
 
-            print(f"\rProgress: {offset}/{n}", end="")
+            total += len(df)
 
-        print("\nDone.")
-        return pd.concat(batches, ignore_index=True) if batches else pd.DataFrame()
+            print(f"\rPage {page} | Batch {len(df)} | Total {total:,}", end="", flush=True)
 
-    # ============================================================================
-    # FUNDINGS EXPORT
-    # ============================================================================
-    def import_fundings(self, company_ids: List[str]) -> pd.DataFrame:
-        rows = []
-        total = len(company_ids)
+            # Safety sleep
+            time.sleep(1)
 
-        print(f"📊 Importing fundings for {total:,} companies")
+            if not next_page_id:
+                logger.info("Reached end of dataset.")
+                break
 
-        for i, cid in enumerate(company_ids, 1):
-            try:
-                r = requests.get(
-                    f"{self.base_url}/companies/{cid}/fundings",
-                    headers=self.headers,
-                    params={"fields": self.get_all_funding_fields()},
-                    timeout=30
-                )
-                r.raise_for_status()
-                items = r.json().get("items", [])
-                if items:
-                    df = pd.json_normalize(items, sep="__")
-                    df["company_id"] = cid
-                    rows.append(df)
-
-                if i % 100 == 0:
-                    print(f"\r{i}/{total}", end="")
-
-                time.sleep(0.5)
-
-            except Exception as e:
-                logger.error(f"Error {cid}: {e}")
-
-        print("\nDone.")
-        return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-
-    # ============================================================================
-    # AUTO-RESUME: find last checkpoint JSON
-    # ============================================================================
-    def find_last_checkpoint(self, prefix: str) -> Optional[str]:
-        jsons = [
-            f for f in os.listdir("checkpoints")
-            if f.startswith(prefix) and f.endswith(".json")
-        ]
-        if not jsons:
-            return None
-
-        jsons.sort()
-        last_json = jsons[-1]
-
-        with open(os.path.join("checkpoints", last_json), "r") as f:
-            meta = json.load(f)
-
-        logger.info(f"🔁 Auto-resume from checkpoint: {last_json}")
-        return meta.get("next_page_id")
-
-    # ============================================================================
-    # STREAMING BULK EXPORT (ZERO RAM) + ETA + AUTO RESUME
-    # ============================================================================
-    def bulk_export(
-        self,
-        max_companies: Optional[int] = None,
-        save_every: int = 100000,
-        output_prefix: str = "dealroom_bulk",
-        resume_next_page_id: Optional[str] = None,
-        auto_resume: bool = True
-    ) -> str:
-
-        os.makedirs("checkpoints", exist_ok=True)
-        os.makedirs("final", exist_ok=True)
-
-        # --------------------------------------------------------------------------------
-        # Auto-resume logic
-        # --------------------------------------------------------------------------------
-        if auto_resume and resume_next_page_id is None:
-            resume_next_page_id = self.find_last_checkpoint(output_prefix)
-
-        if resume_next_page_id:
-            logger.info(f"🔁 Resume with next_page_id={resume_next_page_id}")
-
-        page_size = 100
-        total_fetched = 0
-        next_page_id = resume_next_page_id
-        page_number = 0
-
-        # For ETA
-        start_time = time.time()
-        times = []   # durations of last N pages
-
-        logger.info("🚀 STREAMING bulk export started")
-        logger.info(f"save_every={save_every}")
-
-        try:
-            while True:
-                if max_companies and total_fetched >= max_companies:
-                    break
-
-                page_number += 1
-
-                payload = {"fields": self.get_all_company_fields(), "limit": page_size}
-                if next_page_id:
-                    payload["next_page_id"] = next_page_id
-
-                t0 = time.time()
-
-                r = requests.post(
-                    f"{self.base_url}/companies/bulk",
-                    json=payload,
-                    headers=self.headers,
-                    timeout=90
-                )
-
-                if r.status_code != 200:
-                    logger.error(f"HTTP {r.status_code}: {r.text[:200]}")
-                    break
-
-                data = r.json()
-                items = data.get("items", [])
-                next_page_id = data.get("next_page_id")
-
-                if not items:
-                    break
-
-                df_batch = pd.json_normalize(items, sep="__")
-                batch_size_real = len(df_batch)
-                total_fetched += batch_size_real
-
-                # -----------------------------------------------------------------
-                # ETA calculation
-                # -----------------------------------------------------------------
-                duration = time.time() - t0
-                times.append(duration)
-                if len(times) > 50:
-                    times.pop(0)
-
-                avg_time = sum(times) / len(times)
-                if next_page_id:
-                    # total pages estimate — assume uniform density
-                    est_pages_left = 3427870 / page_size - page_number  # = 3.4M rough
-                    eta_seconds = est_pages_left * avg_time
-                    eta_dt = datetime.now() + timedelta(seconds=eta_seconds)
-                    eta_str = eta_dt.strftime("%Y-%m-%d %H:%M")
-                else:
-                    eta_str = "Soon"
-
-                print(
-                    f"\rPage {page_number} | Batch {batch_size_real} | Total {total_fetched:,} | ETA: {eta_str}",
-                    end="", flush=True
-                )
-
-                # -----------------------------------------------------------------
-                # STREAMING WRITE
-                # -----------------------------------------------------------------
-                ckpt_index = (total_fetched // save_every) * save_every
-                ckpt_str = str(ckpt_index).rjust(9, "0")
-                ckpt_path = f"checkpoints/{output_prefix}_checkpoint_{ckpt_str}.csv.gz"
-
-                df_batch.to_csv(
-                    ckpt_path,
-                    mode="a",
-                    index=False,
-                    header=not os.path.exists(ckpt_path),
-                    compression="gzip"
-                )
-
-                with open(f"checkpoints/{output_prefix}_checkpoint_{ckpt_str}.json", "w") as f:
-                    json.dump({
-                        "next_page_id": next_page_id,
-                        "total": total_fetched,
-                        "timestamp": datetime.now().isoformat()
-                    }, f, indent=2)
-
-                if not next_page_id:
-                    logger.info("End of dataset.")
-                    break
-
-                time.sleep(1)
-
-        except Exception as e:
-            logger.error(f"Exception: {e}")
-            logger.error("💥 Auto-resume will pick up from last checkpoint on next run.")
-
-        print()
-
-        # ============================================================================
-        # FINAL MERGE (streaming)
-        # ============================================================================
-        logger.info("📦 Creating final merged file...")
-
-        final_name = f"final/{output_prefix}_FINAL_{total_fetched}.csv.gz"
-        first = True
-
-        checkpoints = sorted([
-            f for f in os.listdir("checkpoints")
-            if f.endswith(".csv.gz") and f.startswith(output_prefix)
-        ])
-
-        for file in checkpoints:
-            p = os.path.join("checkpoints", file)
-            for chunk in pd.read_csv(p, compression="gzip", chunksize=50000):
-                chunk.to_csv(
-                    final_name,
-                    mode="w" if first else "a",
-                    header=first,
-                    index=False,
-                    compression="gzip"
-                )
-                first = False
-
-        logger.info(f"✅ FINAL FILE READY: {final_name}")
-        return final_name
+        print("\n")
+        logger.info(f"✅ Done. Total rows written: {total:,}")
+        return output_file
 
 
 # ============================================================================
-# MAIN SCRIPT
+# MAIN
 # ============================================================================
 if __name__ == "__main__":
     API_KEY = "f353c6bd59a492aaa4eac73f84aa7c9cf30cc7fd"
 
     importer = DealroomImporter(API_KEY)
-    print("Importer ready")
-
-    importer.bulk_export(
-        max_companies=None,          # все 3.4M
-        save_every=100000,
-        output_prefix="dealroom_bulk",
-        resume_next_page_id=None,    # авто-резюм сам найдёт последний JSON
-        auto_resume=True
+    importer.bulk_export_simple(
+        output_file="dealroom_bulk_stream.csv.gz",
+        page_size=100
     )
