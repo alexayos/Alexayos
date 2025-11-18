@@ -748,3 +748,11 @@ if __name__ == "__main__":
         output_file="dealroom_bulk_stream.csv.gz",
         page_size=100
     )
+
+import subprocess
+
+local = "dealroom_bulk_stream.csv.gz"
+remote = "gs://dealroom-dump/dealroom_bulk_stream.csv.gz"
+
+subprocess.run(["gsutil", "cp", local, remote], check=True)
+print("Uploaded to:", remote)
