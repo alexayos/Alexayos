@@ -751,8 +751,10 @@ if __name__ == "__main__":
 
 import subprocess
 
-local = "dealroom_bulk_stream.csv.gz"
-remote = "gs://dealroom-dump/dealroom_bulk_stream.csv.gz"
+OUTPUT_FILE = "dealroom_bulk_stream.csv.gz"
+import subprocess
 
-subprocess.run(["gsutil", "cp", local, remote], check=True)
-print("Uploaded to:", remote)
+BUCKET_PATH = "gs://dealroom-dump-478609/dealroom_bulk_stream.csv.gz"
+
+subprocess.run(["gsutil", "cp", OUTPUT_FILE, BUCKET_PATH], check=True)
+print("Uploaded to", BUCKET_PATH)
