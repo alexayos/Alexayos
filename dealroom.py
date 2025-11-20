@@ -1,4 +1,4 @@
-# """
+ # """
 # Dealroom Data Importer
 # ======================
 
@@ -726,7 +726,7 @@ class DealroomImporter:
             print(f"\rPage {page} | Batch {len(df)} | Total {total:,}", end="", flush=True)
 
             # Safety sleep
-            time.sleep(1)
+            time.sleep(0.3)
 
             if not next_page_id:
                 logger.info("Reached end of dataset.")
