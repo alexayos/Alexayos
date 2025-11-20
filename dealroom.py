@@ -562,11 +562,15 @@ import requests
 import pandas as pd
 from datetime import datetime
 
+from google.cloud import storage  # для загрузки в GCS
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s — %(levelname)s — %(message)s"
 )
 logger = logging.getLogger("dealroom")
+
+SLEEP_SECONDS = 0.3  # пауза между успешными запросами к API
 
 
 class DealroomImporter:
@@ -647,16 +651,17 @@ class DealroomImporter:
             "dealroom_signal"
         )
 
-    # ============================================================================
-    # STREAMING BULK EXPORT — no checkpoints, no merge, retries 502-friendly
-    # ============================================================================
     def bulk_export_simple(
         self,
-        output_file: str = "dealroom_full.csv.gz",
+        output_file: str = "dealroom_bulk_stream.csv.gz",
         page_size: int = 100
-    ):
+    ) -> int:
+        """
+        Стриминг через /companies/bulk → один gzip-файл.
+        Без чекпоинтов, с ретраями на 5xx и мягким stop при постоянных ошибках.
+        """
 
-        # Prepare file
+        # Если файл был от предыдущего прогона — удаляем
         if os.path.exists(output_file):
             os.remove(output_file)
 
@@ -665,19 +670,19 @@ class DealroomImporter:
         page = 0
 
         logger.info("🚀 Starting bulk export (streaming, no checkpoints)")
-        logger.info(f"Output: {output_file}")
+        logger.info(f"Output file: {output_file}")
 
         while True:
-
             page += 1
             payload = {
                 "fields": self.get_all_company_fields(),
-                "limit": page_size
+                "limit": page_size,
             }
             if next_page_id:
                 payload["next_page_id"] = next_page_id
 
-            # Retry loop (safe within 10 minutes)
+            # Retry-цикл, суммарная задержка << 10 минут
+            r = None
             for attempt in range(6):
                 try:
                     r = requests.post(
@@ -688,7 +693,10 @@ class DealroomImporter:
                     )
                     if r.status_code in (502, 503, 504):
                         wait = 3 + attempt * 2
-                        logger.warning(f"⚠️ {r.status_code} server error. Retry {attempt+1}/6 in {wait}s")
+                        logger.warning(
+                            f"⚠️ {r.status_code} server error. "
+                            f"Retry {attempt+1}/6 in {wait}s"
+                        )
                         time.sleep(wait)
                         continue
 
@@ -697,7 +705,10 @@ class DealroomImporter:
 
                 except Exception as e:
                     wait = 3 + attempt * 2
-                    logger.error(f"Exception: {e}. Retry {attempt+1}/6 in {wait}s")
+                    logger.error(
+                        f"Exception on page {page}, attempt {attempt+1}/6: {e}. "
+                        f"Retry in {wait}s"
+                    )
                     time.sleep(wait)
             else:
                 logger.error("❌ Server kept failing. Stopping cleanly.")
@@ -711,50 +722,65 @@ class DealroomImporter:
                 logger.info("No more items returned. Ending.")
                 break
 
-            # Write batch to file
             df = pd.json_normalize(items, sep="__")
+            batch_n = len(df)
+
+            # Стриминговая запись в один gzip
             df.to_csv(
                 output_file,
                 mode="a",
-                header=not os.path.exists(output_file),
+                header=not os.path.exists(output_file),  # первая запись — с заголовком
                 index=False,
                 compression="gzip"
             )
 
-            total += len(df)
-
-            print(f"\rPage {page} | Batch {len(df)} | Total {total:,}", end="", flush=True)
-
-            # Safety sleep
-            time.sleep(0.3)
+            total += batch_n
+            print(f"\rPage {page} | Batch {batch_n} | Total {total:,}", end="", flush=True)
 
             if not next_page_id:
-                logger.info("Reached end of dataset.")
+                logger.info("Reached end of dataset (no next_page_id).")
                 break
 
-        print("\n")
+            time.sleep(SLEEP_SECONDS)
+
+        print()
         logger.info(f"✅ Done. Total rows written: {total:,}")
-        return output_file
+        return total
+
+
+def upload_to_gcs(local_path: str, bucket_name: str, blob_name: str) -> None:
+    """
+    Загрузка файла в GCS c использованием service account Cloud Run.
+    """
+    logger.info(f"⬆️ Uploading {local_path} → gs://{bucket_name}/{blob_name}")
+    client = storage.Client()  # в Cloud Run используются дефолтные креды
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(local_path)
+    logger.info("✅ Upload finished.")
 
 
 # ============================================================================
 # MAIN
 # ============================================================================
 if __name__ == "__main__":
-    API_KEY = "f353c6bd59a492aaa4eac73f84aa7c9cf30cc7fd"
+    # Лучше читать API-ключ из переменной окружения,
+    # но можешь временно вставить прямо строкой.
+    API_KEY = os.environ.get("DEALROOM_API_KEY", "PASTE_YOUR_KEY_HERE")
 
     importer = DealroomImporter(API_KEY)
-    importer.bulk_export_simple(
-        output_file="dealroom_bulk_stream.csv.gz",
+
+    OUTPUT_FILE = "dealroom_bulk_stream.csv.gz"
+    BUCKET_NAME = "dealroom-dump-478609"
+    BLOB_NAME = "dealroom_bulk_stream.csv.gz"
+
+    total_rows = importer.bulk_export_simple(
+        output_file=OUTPUT_FILE,
         page_size=100
     )
 
-import subprocess
-
-OUTPUT_FILE = "dealroom_bulk_stream.csv.gz"
-import subprocess
-
-BUCKET_PATH = "gs://dealroom-dump-478609/dealroom_bulk_stream.csv.gz"
-
-subprocess.run(["gsutil", "cp", OUTPUT_FILE, BUCKET_PATH], check=True)
-print("Uploaded to", BUCKET_PATH)
+    # Загружаем в GCS только если что-то реально выгрузили
+    if total_rows > 0 and os.path.exists(OUTPUT_FILE):
+        upload_to_gcs(OUTPUT_FILE, BUCKET_NAME, BLOB_NAME)
+    else:
+        logger.warning("Nothing to upload: no rows or file is missing.")
